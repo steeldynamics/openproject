@@ -43,7 +43,7 @@ module Storages
 
           def call(path:)
             query_params = { depth: "1", path:, props: %w[oc:fileid] }
-            Rails.logger.tagged(self.class).info "Requesting File Ids with the following args: #{query_params.inspect}"
+            Rails.logger.tagged(self.class).debug "Requesting File Ids with the following args: #{query_params.inspect}"
             @query.call(**query_params)
           end
         end

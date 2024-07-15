@@ -30,13 +30,12 @@
 
 module Storages
   class NextcloudGroupFolderPropertiesSyncService
-    using Peripherals::ServiceResultRefinements
-
     extend ActiveModel::Naming
     extend ActiveModel::Translation
 
-    PERMISSIONS_MAP = { read_files: 1, write_files: 2, create_files: 4, delete_files: 8, share_files: 16 }.freeze
+    using Peripherals::ServiceResultRefinements
 
+    PERMISSIONS_MAP = { read_files: 1, write_files: 2, create_files: 4, delete_files: 8, share_files: 16 }.freeze
     PERMISSIONS_KEYS = PERMISSIONS_MAP.keys.freeze
     ALL_PERMISSIONS = PERMISSIONS_MAP.values.sum
     NO_PERMISSIONS = 0
@@ -61,8 +60,8 @@ module Storages
 
     def call
       with_logging do
-        log_message "Starting AMPF Sync for Nextcloud Storage #{@storage.id}"
-        prepare_remote_folders.on_failure { return _1 }
+        debug "Starting AMPF Sync for Nextcloud Storage #{@storage.id}"
+        prepare_remote_folders.on_failure { return @result }
         apply_permissions_to_folders
       end
     end
@@ -74,26 +73,17 @@ module Storages
     # @param options [Hash<Symbol, Object>] optional extra parameters for the message generation
     # @return [ServiceResult]
     def add_error(attribute, storage_error, options: {})
-      if storage_error == :error
-        @result.errors.add(:base, storage_error, **options)
-      else
-        @result.errors.add(attribute, storage_error, **options)
-      end
+      attribute = :base if storage_error.code == :error
+      @result.errors.add(attribute, storage_error.code, **options)
       @result
     end
 
     # @return [ServiceResult]
     def prepare_remote_folders
-      remote_folders = remote_root_folder_properties.result_or do |error|
-        format_and_log_error(error, { folder: @storage.group_folder })
-        return add_error(:remote_folder_properties, error.code, options: { group: @storage.group }).fail!
-      end
+      remote_folders = remote_root_folder_map(@storage.group_folder).on_failure { return _1 }.result
+      debug "Found #{remote_folders.count} remote folders"
 
-      ensure_root_folder_permissions.result_or do |error|
-        format_and_log_error(error, { folder: @storage.group_folder })
-        return add_error(:ensure_root_folder_permissions, error.code,
-                         options: { group: @storage.group, username: @storage.username }).fail!
-      end
+      ensure_root_folder_permissions(@storage.group_folder, @storage.group, @storage.username).on_failure { return _1 }
 
       ensure_folders_exist(remote_folders).on_success { hide_inactive_folders(remote_folders) }
     end
@@ -148,16 +138,19 @@ module Storages
         hash[token.origin_user_id] = PERMISSIONS_MAP.values_at(*(PERMISSIONS_KEYS & permissions)).sum
       end
 
+      folder = project_storage.managed_project_folder_path
+
       command_params = {
-        path: project_storage.managed_project_folder_path,
+        path: folder,
         permissions: {
           users: admin_permissions.to_h.merge(users_permissions),
           groups: { "#{@storage.group}": NO_PERMISSIONS }
         }
       }
 
-      set_permissions.call(storage: @storage, **command_params).result_or do |error|
-        format_and_log_error(error, folder: project_storage.managed_project_folder_path)
+      set_permissions.call(storage: @storage, **command_params).on_failure do |service_result|
+        format_and_log_error(service_result.errors, folder:)
+        add_error(:set_folder_permission, service_result.errors, options: { folder: })
       end
     end
 
@@ -172,12 +165,13 @@ module Storages
     end
 
     def hide_inactive_folders(remote_folders)
-      log_message "Hiding folders related to inactive projects"
+      debug "Hiding folders related to inactive projects"
       project_folder_ids = active_project_storages_scope.pluck(:project_folder_id).compact
+
       remote_folders.except("/#{@storage.group_folder}/").each do |(path, attrs)|
         next if project_folder_ids.include?(attrs["fileid"])
 
-        log_message "Hiding project folder #{path}"
+        debug "Hiding project folder #{path}"
         command_params = {
           path:,
           permissions: {
@@ -188,91 +182,100 @@ module Storages
 
         set_permissions.call(storage: @storage, **command_params).on_failure do |service_result|
           format_and_log_error(service_result.errors, folder: path, context: "hide_folder")
-          add_error(:hide_inactive_folders, service_result.errors, options: { folder: path })
+          add_error(:hide_inactive_folders, service_result.errors, options: { path: })
         end
       end
     end
 
     def ensure_folders_exist(remote_folders)
-      log_message "Ensuring project folders exist and are correctly named."
+      debug "Ensuring that automatically managed project folders exist and are correctly named."
       id_folder_map = remote_folders.to_h { |folder, properties| [properties["fileid"], folder] }
 
       active_project_storages_scope.includes(:project).map do |project_storage|
         unless id_folder_map.key?(project_storage.project_folder_id)
-          log_message "#{project_storage.managed_project_folder_path} does not exist. Creating..."
-          next create_folder_stuff(project_storage)
+          debug "#{project_storage.managed_project_folder_path} does not exist. Creating..."
+          next create_remote_folder(project_storage)
         end
 
-        current_path = id_folder_map[project_storage.project_folder_id]
-        if current_path != project_storage.managed_project_folder_path
-          log_message "#{current_path} is misnamed. Renaming to #{project_storage.managed_project_folder_path}"
-          target_folder_name = name_from_path(project_storage.managed_project_folder_path)
-          rename_folder(project_storage.project_folder_id, target_folder_name).on_failure do |service_result|
-            format_and_log_error(service_result.errors,
-                                 folder_id: project_storage.project_folder_id,
-                                 folder_name: target_folder_name)
-
-            return add_error(:rename_folder, service_result.errors).fail!
-          end
-        end
+        rename_folder(project_storage, id_folder_map[project_storage.project_folder_id])&.on_failure { return _1 }
       end
 
       # We processed every folder successfully
       ServiceResult.success
     end
 
-    def name_from_path(path)
-      path.split("/").last
+    # @param project_storage [Storages::ProjectStorage] Storages::ProjectStorage that the remote folder might need renaming
+    # @param current_path [String] current name of the remote project storage folder
+    # @return [ServiceResult, nil]
+    def rename_folder(project_storage, current_path)
+      return if current_path == project_storage.managed_project_folder_path
+
+      name = project_storage.managed_project_folder_name
+      file_id = project_storage.project_folder_id
+
+      debug "#{current_path} is misnamed. Renaming to #{name}"
+      rename_file.call(storage: @storage, auth_strategy:, file_id:, name:).on_failure do |service_result|
+        format_and_log_error(service_result.errors, folder_id: file_id, folder_name: name)
+
+        add_error(:rename_project_folder, service_result.errors,
+                  options: { project_folder_name: name, project_folder_id: file_id }).fail!
+      end
     end
 
-    def rename_folder(folder_id, folder_name)
-      rename_file.call(storage: @storage, auth_strategy:, file_id: folder_id, name: folder_name)
-    end
-
-    def create_folder_stuff(project_storage)
+    def create_remote_folder(project_storage)
       folder_name = project_storage.managed_project_folder_path
       parent_location = Peripherals::ParentFolder.new("/")
 
       created_folder = create_folder.call(storage: @storage, auth_strategy:, folder_name:, parent_location:)
-                                            .result_or do |error|
-        format_and_log_error(error, folder_name:)
+                                            .on_failure do |service_result|
+        format_and_log_error(service_result.errors, folder_name:)
 
-        return add_error(:create_folder, error, options: { folder_name:, parent_location: })
-      end
+        return add_error(:create_folder, service_result.errors, options: { folder_name:, parent_location: })
+      end.result
 
-      project_folder_id = created_folder.id
-      last_project_folder = LastProjectFolder
-                              .find_by(project_storage_id: project_storage.id, mode: project_storage.project_folder_mode)
+      last_project_folder = LastProjectFolder.find_by(
+        project_storage_id: project_storage.id, mode: project_storage.project_folder_mode
+      )
 
-      audit_last_project_folder(last_project_folder, project_folder_id)
-      project_storage.project_folder_id
+      audit_last_project_folder(last_project_folder, created_folder.id)
     end
 
     def audit_last_project_folder(last_project_folder, project_folder_id)
       ApplicationRecord.transaction do
-        last_project_folder.update!(origin_folder_id: project_folder_id)
-        project_storage.update!(project_folder_id:)
-        project_storage.project_folder_id
+        success = last_project_folder.update(origin_folder_id: project_folder_id) &&
+          last_project_folder.project_storage.update(project_folder_id:)
+
+        raise ActiveRecord::Rollback unless success
       end
     end
 
-    def ensure_root_folder_permissions
-      log_message "Setting base permissions for user #{@storage.username} on the #{@storage.group_folder} folder"
+    # @param group_folder [string] name of the Group Folder in Nextcloud.
+    # @param username [String] username for the integration user
+    # @param group [String] group that the user should be part of
+    # @return [ServiceResult]
+    def ensure_root_folder_permissions(group_folder, username, group)
+      debug "Setting base permissions for user #{username} and group #{group} on the #{group_folder} group folder"
+
       command_params = {
-        path: @storage.group_folder,
+        path: group_folder,
         permissions: {
-          users: { @storage.username.to_sym => ALL_PERMISSIONS },
-          groups: { @storage.group.to_sym => PERMISSIONS_MAP[:read_files] }
+          users: { username.to_sym => ALL_PERMISSIONS },
+          groups: { group.to_sym => PERMISSIONS_MAP[:read_files] }
         }
       }
 
-      set_permissions.call(storage: @storage, **command_params)
+      set_permissions.call(storage: @storage, **command_params).on_failure do |service_result|
+        format_and_log_error(service_result.errors, { folder: group_folder })
+        add_error(:ensure_root_folder_permissions, service_result.errors, options: { group:, username: }).fail!
+      end
     end
 
-    ### Base Queries/Commands
-    def remote_root_folder_properties
-      log_message "Retrieving already existing folders under #{@storage.group_folder}"
-      file_ids.call(storage: @storage, path: @storage.group_folder)
+    def remote_root_folder_map(group_folder)
+      debug "Retrieving already existing folders under #{group_folder}"
+      file_ids.call(storage: @storage, path: group_folder).on_failure do |service_result|
+        format_and_log_error(service_result.errors, { folder: group_folder })
+        add_error(:remote_root_folder_map, service_result.errors, options: { group_folder: }).fail!
+      end
     end
 
     def remote_group_users
@@ -313,8 +316,8 @@ module Storages
       logger.error error_message
     end
 
-    def log_message(message)
-      logger.debug(message)
+    def debug(message)
+      logger.info(message)
     end
 
     def with_logging(&)
