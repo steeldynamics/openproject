@@ -274,7 +274,7 @@ module Storages
       debug "Retrieving already existing folders under #{group_folder}"
       file_ids.call(storage: @storage, path: group_folder).on_failure do |service_result|
         format_and_log_error(service_result.errors, { folder: group_folder })
-        add_error(:remote_root_folder_map, service_result.errors, options: { group_folder: }).fail!
+        add_error(:group_folder, service_result.errors, options: { group_folder: }).fail!
       end
     end
 

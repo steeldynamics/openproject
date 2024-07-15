@@ -7,8 +7,8 @@ en:
           unauthorized: "Please check if your AMPF password is correct"
           error: "An unexpected error occurred. Please ensure that you Nextcloud instance is reachable and check OpenProject worker logs for more information"
           attributes:
-            remote_root_folder_map:
-              not_found: "The Group Folder %{group_folder} wasn't found. Please check your Nextcloud setup."
+            group_folder:
+              not_found: "%{group_folder} wasn't found. Please check your Nextcloud setup."
 
   activerecord:
     attributes:
