@@ -48,19 +48,20 @@ module Storages
 
           def call(path:, permissions:)
             if path.blank?
-              ServiceResult.failure(errors: StorageError.new(code: :missing_path))
+              return ServiceResult.failure(errors: StorageError.new(code: :invalid_path))
             end
 
             with_tagged_logger do
               info "Setting permissions #{permissions.inspect} on #{path}"
 
+              body = request_xml_body(permissions[:groups], permissions[:users])
               # This can raise KeyErrors, we probably should just default to enpty Arrays.
               response = OpenProject
                 .httpx
                 .basic_auth(@username, @password)
                 .request(
                   "PROPPATCH",
-                  Storages::UrlBuilder.url(@storage.uri, "remote.php/dav/files", @username, path),
+                  UrlBuilder.url(@storage.uri, "remote.php/dav/files", @username, path),
                   xml: body
                 )
 
