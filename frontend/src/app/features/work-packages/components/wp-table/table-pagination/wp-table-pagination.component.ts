@@ -64,7 +64,7 @@ export class WorkPackageTablePaginationComponent extends TablePaginationComponen
     readonly wpTableSortBy:WorkPackageViewSortByService,
     readonly I18n:I18nService,
   ) {
-    super(paginationService, cdRef, I18n);
+    super(paginationService, cdRef, I18n, wpTableSortBy);
   }
 
   ngOnInit() {
